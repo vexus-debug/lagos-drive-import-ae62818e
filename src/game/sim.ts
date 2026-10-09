@@ -77,7 +77,9 @@ export function createState(W: World): GameState {
     const a = route[idx], b = route[(idx + 1) % 4];
     const f = Math.random();
     return {
-      id: i, route, idx: (idx + 1) % 4, dir: 1 as const, x: a.x + (b.x - a.x) * f, z: a.z + (b.z - a.z) * f, h: 0,
+      id: i, route, idx: (idx + 1) % 4, dir: 1 as const, x: a.x + (b.x - a.x) * f, z: a.z + (b.z - a.z) * f, y: 0, h: 0,
+      vx: 0, vy: 0, vz: 0, pitch: 0, roll: 0, spinX: 0, spinZ: 0, rollTarget: 0,
+      avoidance: 0, stumble: 0, hitCooldown: 0,
       speed: 1.1 + Math.random() * 0.7, dead: 0, color: PED_COLORS[i % PED_COLORS.length],
       wrap: Math.random() < 0.35 ? PED_COLORS[(i * 3 + 2) % PED_COLORS.length] : null, obj: null, phase: Math.random() * 6,
     };
@@ -404,27 +406,130 @@ function police(S: GameState, W: World, dt: number, A: GameAudio) {
 }
 
 function peds(S: GameState, dt: number, A: GameAudio) {
-  const c = S.car;
+  const playerCar = S.car;
   for (const p of S.peds) {
+    p.hitCooldown = Math.max(0, p.hitCooldown - dt);
     if (p.dead > 0) {
       p.dead -= dt;
+      p.vy -= 12 * dt;
+      p.y += p.vy * dt;
+      p.x += p.vx * dt;
+      p.z += p.vz * dt;
+      p.vx *= Math.exp(-2.2 * dt);
+      p.vz *= Math.exp(-2.2 * dt);
+      p.spinX *= Math.exp(-3.4 * dt);
+      p.spinZ *= Math.exp(-3.4 * dt);
+      p.pitch += p.spinX * dt;
+      p.roll += p.spinZ * dt;
+      if (p.y <= 0) {
+        p.y = 0;
+        if (p.vy < -2) p.vy = -p.vy * 0.16;
+        else p.vy = 0;
+        p.pitch *= Math.exp(-5 * dt);
+        p.roll *= Math.exp(-5 * dt);
+      }
       if (p.dead <= 0) {
         const a = p.route[p.idx];
-        p.x = a.x; p.z = a.z;
+        p.x = a.x; p.z = a.z; p.y = 0; p.vx = 0; p.vy = 0; p.vz = 0;
+        p.pitch = 0; p.roll = 0; p.spinX = 0; p.spinZ = 0;
       }
+      continue;
+    }
+    if (p.stumble > 0) {
+      p.stumble = Math.max(0, p.stumble - dt);
+      p.x += p.vx * dt; p.z += p.vz * dt;
+      const damp = Math.exp(-5 * dt);
+      p.vx *= damp; p.vz *= damp;
+      p.roll += (p.rollTarget - p.roll) * (1 - Math.exp(-8 * dt));
+      if (p.stumble === 0) { p.vx = 0; p.vz = 0; p.rollTarget = 0; }
+      p.phase += dt * p.speed * 2;
       continue;
     }
     const t = p.route[p.idx];
     const dx = t.x - p.x, dz = t.z - p.z, d = Math.hypot(dx, dz);
-    if (d < 0.6) p.idx = (p.idx + p.dir + 4) % 4;
-    else { p.x += (dx / d) * p.speed * dt; p.z += (dz / d) * p.speed * dt; p.h = Math.atan2(dx, dz); }
-    p.phase += dt * p.speed * 5;
-    if (c && Math.abs(c.speed) > 4 && Math.hypot(p.x - c.x, p.z - c.z) < SPECS[c.type].r + 0.6) {
-      p.dead = 20;
-      S.heat += 1;
-      A.thud();
-      if (S.heat < 2) msg(S, "You hit a pedestrian! Police alerted.");
+    if (d < 0.75) p.idx = (p.idx + p.dir + 4) % 4;
+    const target = p.route[p.idx];
+    const tx = target.x - p.x, tz = target.z - p.z, td = Math.hypot(tx, tz);
+    let desiredX = td > 0.001 ? (tx / td) * p.speed : 0;
+    let desiredZ = td > 0.001 ? (tz / td) * p.speed : 0;
+
+    // Steer aside from nearby pedestrians instead of letting sidewalk crowds overlap.
+    for (const other of S.peds) {
+      if (other === p || other.dead > 0) continue;
+      const ox = p.x - other.x, oz = p.z - other.z, od = Math.hypot(ox, oz);
+      if (od > 0.001 && od < 0.95) {
+        const strength = (0.95 - od) * 1.7;
+        desiredX += (ox / od) * strength;
+        desiredZ += (oz / od) * strength;
+      }
     }
+
+    let threatDistance = Infinity;
+    let threatCar: Car | null = null;
+    for (const car of S.cars) {
+      if (!car.active || car.ai === "parked") continue;
+      const cx = p.x - car.x, cz = p.z - car.z, cd = Math.hypot(cx, cz);
+      const speed = car.ai === "traffic" ? Math.abs(car.speed) : Math.hypot(car.vx, car.vz);
+      if (cd > 11 || speed < 2) continue;
+      const ch = car.ai === "traffic" ? car.h : Math.atan2(car.vx, car.vz);
+      const fx = Math.sin(ch), fz = Math.cos(ch);
+      const along = cx * fx + cz * fz;
+      const lateral = Math.abs(cx * fz - cz * fx);
+      if (along < -1 || along > 10 || lateral > SPECS[car.type].r + 0.85 || cd >= threatDistance) continue;
+      threatDistance = cd;
+      threatCar = car;
+    }
+
+    if (threatCar) {
+      const carSpeed = threatCar.ai === "traffic" ? Math.abs(threatCar.speed) : Math.hypot(threatCar.vx, threatCar.vz);
+      const carHeading = threatCar.ai === "traffic" ? threatCar.h : Math.atan2(threatCar.vx, threatCar.vz);
+      if (threatDistance < SPECS[threatCar.type].r + 1 && playerCar === threatCar && carSpeed > 4 && p.hitCooldown <= 0) {
+        const impactX = Math.sin(carHeading), impactZ = Math.cos(carHeading);
+        p.dead = 5.5;
+        p.vx = impactX * Math.min(9, carSpeed * 0.55);
+        p.vz = impactZ * Math.min(9, carSpeed * 0.55);
+        p.vy = Math.min(4.8, 1.2 + carSpeed * 0.18);
+        p.spinX = 5.5 + carSpeed * 0.18;
+        p.spinZ = (p.id % 2 === 0 ? 1 : -1) * (2.5 + carSpeed * 0.12);
+        p.hitCooldown = 1;
+        S.heat += 1;
+        A.thud();
+        if (S.heat < 2) msg(S, "You hit a pedestrian! Police alerted.");
+        continue;
+      }
+      if (threatDistance < 3.1) {
+        p.avoidance = Math.min(1, p.avoidance + dt * 5);
+        const side = p.id % 2 === 0 ? 1 : -1;
+        const sideX = Math.cos(carHeading) * side, sideZ = -Math.sin(carHeading) * side;
+        desiredX += sideX * (1.8 + p.avoidance * 1.2);
+        desiredZ += sideZ * (1.8 + p.avoidance * 1.2);
+        if (threatDistance < 1.5 && carSpeed < 4 && playerCar === threatCar) {
+          p.stumble = 0.7;
+          p.vx = sideX * 1.6;
+          p.vz = sideZ * 1.6;
+          p.rollTarget = side * -0.22;
+        }
+      } else if (threatDistance < 6) {
+        p.avoidance = Math.min(1, p.avoidance + dt * 2);
+        desiredX *= 0.2;
+        desiredZ *= 0.2;
+      }
+    } else {
+      p.avoidance = Math.max(0, p.avoidance - dt * 2.5);
+    }
+
+    const desiredSpeed = Math.hypot(desiredX, desiredZ);
+    if (desiredSpeed > p.speed * 1.7) { desiredX *= (p.speed * 1.7) / desiredSpeed; desiredZ *= (p.speed * 1.7) / desiredSpeed; }
+    const response = 1 - Math.exp(-5.5 * dt);
+    p.vx += (desiredX - p.vx) * response;
+    p.vz += (desiredZ - p.vz) * response;
+    p.x += p.vx * dt;
+    p.z += p.vz * dt;
+    const targetHeading = Math.atan2(p.vx, p.vz);
+    const turn = wrapA(targetHeading - p.h);
+    p.h += clamp(turn, -3.8 * dt, 3.8 * dt);
+    p.roll += (p.avoidance * (p.id % 2 === 0 ? -0.09 : 0.09) - p.roll) * (1 - Math.exp(-5 * dt));
+    p.phase += dt * Math.hypot(p.vx, p.vz) * 5;
   }
 }
 
